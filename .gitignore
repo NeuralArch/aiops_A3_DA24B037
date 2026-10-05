@@ -1,3 +1,9 @@
 data/
 *.parquet
 __pycache__/
+data/
+*.parquet
+__pycache__/
+data/
+*.parquet
+__pycache__/

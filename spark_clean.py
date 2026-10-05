@@ -17,10 +17,12 @@ Run (after the master/workers are up):
 """
 
 import argparse
+import glob
+import os
 import time
 
 from pyspark.sql import SparkSession, functions as F
-from pyspark.sql.types import DoubleType
+from pyspark.sql.types import DoubleType, LongType
 
 # ---- Config: adjust to match your actual column names ----------------
 TRIP_PICKUP_TS = "tpep_pickup_datetime"
@@ -52,6 +54,40 @@ def avg_speed_mph(distance_miles, pickup_ts, dropoff_ts):
     return float(distance_miles) / hours
 
 
+def read_trips_parquet(spark, input_dir):
+    """
+    NYC TLC monthly parquet files don't share a consistent physical schema —
+    e.g. VendorID is stored as INT32 in some months and INT64/bigint in others.
+    Spark's directory-level reader (and even mergeSchema) can't reconcile this
+    at the column-encoding level, so we read each file separately, normalize
+    known mismatched columns, and union the results.
+    """
+    files = sorted(glob.glob(os.path.join(input_dir, "*.parquet")))
+    if not files:
+        raise FileNotFoundError(f"No .parquet files found under {input_dir}")
+
+    frames = []
+    for f in files:
+        df = spark.read.parquet(f)
+        # Normalize columns known to vary in physical type across monthly files
+        if "VendorID" in df.columns:
+            df = df.withColumn("VendorID", F.col("VendorID").cast(LongType()))
+        if "RatecodeID" in df.columns:
+            df = df.withColumn("RatecodeID", F.col("RatecodeID").cast(LongType()))
+        if "PULocationID" in df.columns:
+            df = df.withColumn("PULocationID", F.col("PULocationID").cast(LongType()))
+        if "DOLocationID" in df.columns:
+            df = df.withColumn("DOLocationID", F.col("DOLocationID").cast(LongType()))
+        if "payment_type" in df.columns:
+            df = df.withColumn("payment_type", F.col("payment_type").cast(LongType()))
+        frames.append(df)
+
+    result = frames[0]
+    for df in frames[1:]:
+        result = result.unionByName(df, allowMissingColumns=True)
+    return result
+
+
 def main():
     args = parse_args()
 
@@ -62,20 +98,13 @@ def main():
 
     t0 = time.time()
 
-    reader = spark.read.option("header", True) if args.format == "csv" else spark.read
-    read_fmt = reader.format(args.format) if args.format != "csv" else reader
-
     # ---- 1. Ingestion ----
-    trips = (
-        read_fmt.load(args.input)
-        if args.format != "csv"
-        else spark.read.option("header", True).csv(args.input)
-    )
-    locations = (
-        spark.read.option("header", True).csv(args.locations)
-        if args.format == "csv"
-        else spark.read.parquet(args.locations)
-    )
+    if args.format == "csv":
+        trips = spark.read.option("header", True).csv(args.input)
+        locations = spark.read.option("header", True).csv(args.locations)
+    else:
+        trips = read_trips_parquet(spark, args.input)
+        locations = spark.read.parquet(args.locations)
 
     ingest_time = time.time() - t0
     print(f"[TIMING] Ingestion: {ingest_time:.2f}s")
